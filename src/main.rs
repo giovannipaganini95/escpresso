@@ -1,7 +1,7 @@
 use anyhow::Result;
-use codepage_437::{BorrowFromCp437, CP437_CONTROL};
 use eframe::egui;
 use encoding_rs::Encoding;
+use oem_cp::code_table::DECODING_TABLE_CP_MAP;
 use qrcode::{Color as QrColor, QrCode};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -157,6 +157,25 @@ impl Default for PrinterState {
             double_strike: false,
             font: 0, // Default: Font A
         }
+    }
+}
+
+/// Map an ESC/POS codepage number (from `ESC t n`) to the corresponding
+/// Windows codepage number used by `oem_cp::code_table::DECODING_TABLE_CP_MAP`.
+///
+/// Returns `None` for codepages that are not OEM/DOS pages and should fall
+/// through to `encoding_rs` instead (e.g. Windows-1252, Shift-JIS).
+fn escpos_to_windows_cp(escpos_cp: u8) -> Option<u16> {
+    match escpos_cp {
+        0       => Some(437),  // PC437
+        2       => Some(850),  // PC850
+        3       => Some(860),  // PC860 (Portuguese)
+        4       => Some(863),  // PC863 (French-Canadian)
+        5       => Some(865),  // PC865 (Nordic)
+        14 | 19 => Some(858),  // PC858 (CP850 + €)
+        17      => Some(866),  // PC866 (Cyrillic)
+        18      => Some(852),  // PC852 (Central European)
+        _       => None,
     }
 }
 
@@ -532,11 +551,14 @@ impl EscPosRenderer {
         }
 
         // Decode bytes using current codepage
-        let decoded = if self.state.code_page == 0 {
-            // CP437 - use codepage-437 crate
-            String::borrow_from_cp437(&self.current_line, &CP437_CONTROL)
+        let decoded = if let Some(cp_num) = escpos_to_windows_cp(self.state.code_page) {
+            // OEM/DOS codepage — use oem_cp tables (encoding_rs doesn't cover these)
+            DECODING_TABLE_CP_MAP
+                .get(&cp_num)
+                .map(|t| t.decode_string_lossy(&self.current_line))
+                .unwrap_or_else(|| String::from_utf8_lossy(&self.current_line).into_owned())
         } else {
-            // Other codepages - use encoding_rs
+            // Windows-125x, Shift-JIS, etc. — use encoding_rs
             let (decoded_cow, _encoding_used, had_errors) =
                 self.state.encoding.decode(&self.current_line);
 
@@ -622,11 +644,21 @@ impl EscPosRenderer {
                 }
             }
             b'd' => {
+                // ESC d n - Print and feed n lines
                 i += 1;
                 if i < data.len() {
-                    let lines = data[i];
+                    let lines = data[i] as usize;
+                    self.log_debug(&format!("ESC d: print and feed {} lines", lines));
+                    // "Print and feed" — flush buffered text first, then feed n lines.
+                    // Each iteration mirrors the LF handler: flush text if present,
+                    // otherwise push a blank Separator (if something has been printed).
                     for _ in 0..lines {
-                        self.elements.push(ReceiptElement::Separator);
+                        if !self.current_line.is_empty() {
+                            self.flush_line();
+                            self.current_line.clear();
+                        } else if !self.elements.is_empty() {
+                            self.elements.push(ReceiptElement::Separator);
+                        }
                     }
                     i += 1;
                 }
@@ -789,23 +821,13 @@ impl EscPosRenderer {
                 i += 1;
                 if i < data.len() {
                     self.state.code_page = data[i];
-                    // Map codepage numbers to encoding_rs encodings
-                    // Note: CP437 (codepage 0) is handled specially in flush_line()
+                    // OEM/DOS codepages (0,2-5,14,17-19) are decoded via oem_cp in
+                    // flush_line(); the encoding field is only used for the remaining
+                    // paths that go through encoding_rs (Win-1252, Shift-JIS, etc.).
                     self.state.encoding = match data[i] {
-                        0 => encoding_rs::WINDOWS_1252,  // CP437 (handled specially)
-                        1 => encoding_rs::WINDOWS_1252,  // Katakana (approximation)
-                        2 => encoding_rs::WINDOWS_1252,  // CP850
-                        3 => encoding_rs::WINDOWS_1252,  // CP860
-                        4 => encoding_rs::WINDOWS_1252,  // CP863
-                        5 => encoding_rs::WINDOWS_1252,  // CP865
-                        16 => encoding_rs::WINDOWS_1252, // Windows-1252 (Western European)
-                        17 => encoding_rs::WINDOWS_1251, // CP866 -> Windows-1251 (Cyrillic)
-                        18 => encoding_rs::WINDOWS_1250, // CP852 -> Windows-1250 (Central European)
-                        19 => encoding_rs::WINDOWS_1252, // CP858 (like CP850 with Euro)
-                        20 => encoding_rs::SHIFT_JIS,    // Shift JIS (Japanese)
-                        21 => encoding_rs::SHIFT_JIS,
-                        255 => encoding_rs::SHIFT_JIS,
-                        _ => encoding_rs::WINDOWS_1252, // Default fallback
+                        16              => encoding_rs::WINDOWS_1252, // Windows-1252
+                        20 | 21 | 255   => encoding_rs::SHIFT_JIS,    // Shift JIS (Japanese)
+                        _               => encoding_rs::WINDOWS_1252, // OEM pages or fallback
                     };
                     if self.debug {
                         self.log_debug(&format!("ESC t: selected codepage {}", data[i]));
@@ -865,14 +887,22 @@ impl EscPosRenderer {
                 }
             }
             b'J' => {
-                // ESC J n - Print and feed n lines (used by zj-58 CUPS driver)
+                // ESC J n - Print and feed paper n dots (used by zj-58 CUPS driver)
                 i += 1;
                 if i < data.len() {
-                    let lines = data[i];
-                    self.log_debug(&format!("ESC J: feed {} lines", lines));
-                    // Add line feeds as specified (each line is ~1/6 inch or ~4.23mm)
-                    // Display exactly as ESC/POS specifies for accurate virtual printer behavior
-                    for _ in 0..lines {
+                    let dots = data[i];
+                    self.log_debug(&format!("ESC J: print and feed {} dots", dots));
+                    // Flush buffered text first (the "print" part of "print and feed")
+                    if !self.current_line.is_empty() {
+                        self.flush_line();
+                        self.current_line.clear();
+                    }
+                    // ESC J feeds paper by dots, not full lines.  For display purposes
+                    // treat each ~24-dot increment as roughly one line separator so the
+                    // receipt doesn't collapse, while still avoiding runaway whitespace
+                    // for tiny advances.
+                    let line_separators = (dots as usize).div_ceil(24).min(4);
+                    for _ in 0..line_separators {
                         self.elements.push(ReceiptElement::Separator);
                     }
                     i += 1;

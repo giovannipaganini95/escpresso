@@ -135,10 +135,18 @@ Other control characters (0x00-0x1F) are silently ignored.
 
 | Command | Hex | Description | Status |
 |---------|-----|-------------|--------|
-| GS H    | 1D 48 n | Select HRI printing position | ✅ Implemented (consumed) |
-| GS h    | 1D 68 n | Set barcode height | ✅ Implemented (consumed) |
-| GS w    | 1D 77 n | Set barcode width | ✅ Implemented (consumed) |
-| GS k    | 1D 6B m [data] | Print barcode | ✅ Implemented (data consumed) |
+| GS H    | 1D 48 n | Select HRI printing position | ✅ Implemented (none/above/below/both) |
+| GS h    | 1D 68 n | Set barcode height | ✅ Implemented (1-255 dots) |
+| GS w    | 1D 77 n | Set barcode width | ✅ Implemented (module width 1-6) |
+| GS k    | 1D 6B m [data] | Print barcode | ✅ Implemented (UPC-A/E, EAN-13/8, Code39, ITF, Codabar, Code93, Code128) |
+
+### 2D Codes
+
+| Command | Hex | Description | Status |
+|---------|-----|-------------|--------|
+| GS ( k cn=49 | 1D 28 6B ... | QR Code commands | ✅ Implemented (model, size, EC, store, print) |
+| GS ( k cn=48 | 1D 28 6B ... | PDF417 commands | ✅ Implemented (columns, rows, module size, EC, store, print) |
+| GS ( k cn=50 | 1D 28 6B ... | DataMatrix commands | ✅ Implemented (module size, store, print) |
 
 ### Extended Commands
 

@@ -3,6 +3,7 @@ use eframe::egui;
 use encoding_rs::Encoding;
 use oem_cp::code_table::DECODING_TABLE_CP_MAP;
 use qrcode::{Color as QrColor, QrCode};
+use rxing::{BarcodeFormat, MultiFormatWriter, Writer};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -98,6 +99,24 @@ enum ReceiptElement {
         offset: u16,
         print_area_width: u16,
     },
+    Barcode {
+        data: Vec<u8>,
+        barcode_type: BarcodeType,
+        height: u8,
+        module_width: u8,
+        hri_position: HriPosition,
+        alignment: Alignment,
+        offset: u16,
+        print_area_width: u16,
+    },
+    Barcode2D {
+        data: Vec<u8>,
+        variant: Barcode2DVariant,
+        module_size: u8,
+        alignment: Alignment,
+        offset: u16,
+        print_area_width: u16,
+    },
     PaperCut {
         cut_type: String,
     },
@@ -115,6 +134,49 @@ enum Alignment {
     Left,
     Center,
     Right,
+}
+
+#[derive(Debug, Clone)]
+enum BarcodeType {
+    UpcA,
+    UpcE,
+    Ean13,
+    Ean8,
+    Code39,
+    Itf,
+    Codabar,
+    Code93,
+    Code128,
+}
+
+impl BarcodeType {
+    fn to_rxing_format(&self) -> BarcodeFormat {
+        match self {
+            BarcodeType::UpcA => BarcodeFormat::UPC_A,
+            BarcodeType::UpcE => BarcodeFormat::UPC_E,
+            BarcodeType::Ean13 => BarcodeFormat::EAN_13,
+            BarcodeType::Ean8 => BarcodeFormat::EAN_8,
+            BarcodeType::Code39 => BarcodeFormat::CODE_39,
+            BarcodeType::Itf => BarcodeFormat::ITF,
+            BarcodeType::Codabar => BarcodeFormat::CODABAR,
+            BarcodeType::Code93 => BarcodeFormat::CODE_93,
+            BarcodeType::Code128 => BarcodeFormat::CODE_128,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum HriPosition {
+    None,
+    Above,
+    Below,
+    Both,
+}
+
+#[derive(Debug, Clone)]
+enum Barcode2DVariant {
+    Pdf417,
+    DataMatrix,
 }
 
 #[derive(Debug)]
@@ -189,6 +251,17 @@ struct EscPosRenderer {
     qr_data: Vec<u8>,
     qr_size: u8,
     qr_error_correction: u8,
+    barcode_hri_position: HriPosition,
+    barcode_height: u8,
+    barcode_module_width: u8,
+    pdf417_data: Vec<u8>,
+    pdf417_columns: u8,
+    pdf417_rows: u8,
+    pdf417_module_width: u8,
+    pdf417_error_correction: u8,
+    pdf417_truncated: bool,
+    datamatrix_data: Vec<u8>,
+    datamatrix_module_size: u8,
     response_queue: Vec<u8>,
     last_was_binary: bool, // Track if last command was binary (raster, etc.)
 }
@@ -205,6 +278,17 @@ impl EscPosRenderer {
             qr_data: Vec::new(),
             qr_size: 3,
             qr_error_correction: 0,
+            barcode_hri_position: HriPosition::None,
+            barcode_height: 162,
+            barcode_module_width: 3,
+            pdf417_data: Vec::new(),
+            pdf417_columns: 0,
+            pdf417_rows: 0,
+            pdf417_module_width: 3,
+            pdf417_error_correction: 1,
+            pdf417_truncated: false,
+            datamatrix_data: Vec::new(),
+            datamatrix_module_size: 3,
             response_queue: Vec::new(),
             last_was_binary: false,
         }
@@ -601,6 +685,15 @@ impl EscPosRenderer {
         match cmd {
             b'@' => {
                 self.state = PrinterState::default();
+                self.barcode_hri_position = HriPosition::None;
+                self.barcode_height = 162;
+                self.barcode_module_width = 3;
+                self.pdf417_module_width = 3;
+                self.pdf417_error_correction = 1;
+                self.pdf417_columns = 0;
+                self.pdf417_rows = 0;
+                self.pdf417_truncated = false;
+                self.datamatrix_module_size = 3;
                 i += 1;
             }
             b'E' => {
@@ -1085,42 +1178,131 @@ impl EscPosRenderer {
                     i += 2;
                 }
             }
-            b'H' | b'h' | b'w' | b'k' => {
-                // Barcode height, HRI position, barcode width, barcode print
+            b'H' => {
+                // GS H n - Set HRI (Human Readable Interpretation) position
                 i += 1;
                 if i < data.len() {
-                    if cmd == b'k' {
-                        // Barcode data follows
-                        let barcode_type = data[i];
-                        i += 1;
-                        if barcode_type < 6 {
-                            // Variable length barcode - find NUL terminator
-                            while i < data.len() && data[i] != 0 {
-                                i += 1;
-                            }
-                            if i < data.len() {
-                                i += 1; // skip NUL
-                            }
+                    self.barcode_hri_position = match data[i] {
+                        1 => HriPosition::Above,
+                        2 => HriPosition::Below,
+                        3 => HriPosition::Both,
+                        _ => HriPosition::None,
+                    };
+                    self.log_debug(&format!(
+                        "GS H: HRI position = {:?}",
+                        self.barcode_hri_position
+                    ));
+                    i += 1;
+                }
+            }
+            b'h' => {
+                // GS h n - Set barcode height (1-255 dots, default 162)
+                i += 1;
+                if i < data.len() {
+                    self.barcode_height = data[i].max(1);
+                    self.log_debug(&format!("GS h: barcode height = {}", self.barcode_height));
+                    i += 1;
+                }
+            }
+            b'w' => {
+                // GS w n - Set barcode module width (1-6, default 3)
+                i += 1;
+                if i < data.len() {
+                    self.barcode_module_width = data[i].clamp(1, 6);
+                    self.log_debug(&format!(
+                        "GS w: barcode width = {}",
+                        self.barcode_module_width
+                    ));
+                    i += 1;
+                }
+            }
+            b'k' => {
+                // GS k m [data] - Print barcode
+                i += 1;
+                if i < data.len() {
+                    let barcode_type_byte = data[i];
+                    i += 1;
+
+                    let (barcode_type, barcode_data) = if barcode_type_byte < 6 {
+                        // Format A: GS k m d1...dk NUL (NUL-terminated)
+                        let bt = match barcode_type_byte {
+                            0 => BarcodeType::UpcA,
+                            1 => BarcodeType::UpcE,
+                            2 => BarcodeType::Ean13,
+                            3 => BarcodeType::Ean8,
+                            4 => BarcodeType::Code39,
+                            5 => BarcodeType::Itf,
+                            _ => unreachable!(),
+                        };
+                        let start = i;
+                        while i < data.len() && data[i] != 0 {
+                            i += 1;
+                        }
+                        let d = data[start..i].to_vec();
+                        if i < data.len() {
+                            i += 1; // skip NUL
+                        }
+                        (bt, d)
+                    } else if (65..=73).contains(&barcode_type_byte) {
+                        // Format B: GS k m n d1...dn (length-prefixed)
+                        let bt = match barcode_type_byte {
+                            65 => BarcodeType::UpcA,
+                            66 => BarcodeType::UpcE,
+                            67 => BarcodeType::Ean13,
+                            68 => BarcodeType::Ean8,
+                            69 => BarcodeType::Code39,
+                            70 => BarcodeType::Itf,
+                            71 => BarcodeType::Codabar,
+                            72 => BarcodeType::Code93,
+                            73 => BarcodeType::Code128,
+                            _ => unreachable!(),
+                        };
+                        if i < data.len() {
+                            let len = data[i] as usize;
+                            i += 1;
+                            let end = (i + len).min(data.len());
+                            let d = data[i..end].to_vec();
+                            i = end;
+                            (bt, d)
                         } else {
-                            // Fixed length barcode
-                            if i < data.len() {
-                                let len = data[i] as usize;
-                                i += 1 + len;
-                            }
+                            return Ok(i);
                         }
                     } else {
-                        i += 1;
+                        self.log_debug(&format!(
+                            "GS k: unknown barcode type {}",
+                            barcode_type_byte
+                        ));
+                        return Ok(i);
+                    };
+
+                    if !barcode_data.is_empty() {
+                        if !self.current_line.is_empty() {
+                            self.flush_line();
+                            self.current_line.clear();
+                        }
+
+                        self.elements.push(ReceiptElement::Barcode {
+                            data: barcode_data,
+                            barcode_type,
+                            height: self.barcode_height,
+                            module_width: self.barcode_module_width,
+                            hri_position: self.barcode_hri_position,
+                            alignment: self.state.alignment.clone(),
+                            offset: self.state.horizontal_offset,
+                            print_area_width: self.state.print_area_width,
+                        });
+
+                        self.state.horizontal_offset = 0;
                     }
                 }
             }
             b'(' => {
-                // Extended commands
+                // Extended commands (QR Code, PDF417, DataMatrix)
                 i += 1;
                 if i < data.len() {
                     let subcmd = data[i];
                     if subcmd == b'k' {
-                        // QR Code commands
-                        i = self.handle_qr_code(data, i)?;
+                        i = self.handle_gs_paren_k(data, i)?;
                     } else {
                         // Other extended commands
                         if i + 2 < data.len() {
@@ -1650,7 +1832,7 @@ impl EscPosRenderer {
         Ok(i)
     }
 
-    fn handle_qr_code(&mut self, data: &[u8], mut i: usize) -> Result<usize> {
+    fn handle_gs_paren_k(&mut self, data: &[u8], mut i: usize) -> Result<usize> {
         let start_i = i - 1;
 
         // GS ( k pL pH cn fn [parameters]
@@ -1670,67 +1852,231 @@ impl EscPosRenderer {
 
         i += 4;
 
-        if cn != 49 {
-            // Not a QR code command
-            let skip = param_len.saturating_sub(2);
-            i += skip.min(data.len() - i);
-            return Ok(i);
-        }
-
-        match fn_code {
-            65 | 67 => {
-                // 65: Set QR model, 67: Set module size
-                if i < data.len() {
-                    if fn_code == 67 {
-                        self.qr_size = data[i];
+        match cn {
+            48 => {
+                // PDF417 commands
+                match fn_code {
+                    65 => {
+                        if i < data.len() {
+                            self.pdf417_columns = data[i];
+                            self.log_debug(&format!(
+                                "GS ( k PDF417: columns = {}",
+                                self.pdf417_columns
+                            ));
+                            i += 1;
+                        }
                     }
-                    i += 1;
-                }
-            }
-            69 => {
-                // Set error correction level
-                if i < data.len() {
-                    self.qr_error_correction = data[i];
-                    i += 1;
-                }
-            }
-            80 => {
-                // Store QR data
-                let data_len = param_len.saturating_sub(3);
-                if i + data_len > data.len() {
-                    self.log_debug("GS ( k QR data incomplete");
-                    return Ok(start_i);
-                }
-                self.qr_data = data[i..i + data_len].to_vec();
-                i += data_len;
-            }
-            81 => {
-                // Print QR code
-                if !self.qr_data.is_empty() {
-                    if !self.current_line.is_empty() {
-                        self.flush_line();
-                        self.current_line.clear();
+                    66 => {
+                        if i < data.len() {
+                            self.pdf417_rows = data[i];
+                            self.log_debug(&format!(
+                                "GS ( k PDF417: rows = {}",
+                                self.pdf417_rows
+                            ));
+                            i += 1;
+                        }
                     }
+                    67 => {
+                        if i < data.len() {
+                            self.pdf417_module_width = data[i].clamp(1, 8);
+                            self.log_debug(&format!(
+                                "GS ( k PDF417: module width = {}",
+                                self.pdf417_module_width
+                            ));
+                            i += 1;
+                        }
+                    }
+                    68 => {
+                        // Row height (consume)
+                        if i < data.len() {
+                            i += 1;
+                        }
+                    }
+                    69 => {
+                        if i < data.len() {
+                            self.pdf417_error_correction = data[i];
+                            self.log_debug(&format!(
+                                "GS ( k PDF417: error correction = {}",
+                                self.pdf417_error_correction
+                            ));
+                            i += 1;
+                        }
+                    }
+                    70 => {
+                        if i < data.len() {
+                            self.pdf417_truncated = data[i] == 1;
+                            i += 1;
+                        }
+                    }
+                    80 => {
+                        let data_len = param_len.saturating_sub(3);
+                        if i + data_len > data.len() {
+                            self.log_debug("GS ( k PDF417 data incomplete");
+                            return Ok(start_i);
+                        }
+                        self.pdf417_data = data[i..i + data_len].to_vec();
+                        self.log_debug(&format!(
+                            "GS ( k PDF417: stored {} bytes",
+                            data_len
+                        ));
+                        i += data_len;
+                    }
+                    81 => {
+                        // Transmit size (skip)
+                        let skip = param_len.saturating_sub(2);
+                        i += skip.min(data.len() - i);
+                    }
+                    82 => {
+                        if !self.pdf417_data.is_empty() {
+                            if !self.current_line.is_empty() {
+                                self.flush_line();
+                                self.current_line.clear();
+                            }
 
-                    let qr_string = String::from_utf8_lossy(&self.qr_data).to_string();
-                    let size = (self.qr_size as usize).clamp(1, 16);
+                            self.elements.push(ReceiptElement::Barcode2D {
+                                data: self.pdf417_data.clone(),
+                                variant: Barcode2DVariant::Pdf417,
+                                module_size: self.pdf417_module_width,
+                                alignment: self.state.alignment.clone(),
+                                offset: self.state.horizontal_offset,
+                                print_area_width: self.state.print_area_width,
+                            });
 
-                    self.elements.push(ReceiptElement::QrCode {
-                        data: qr_string,
-                        size,
-                        alignment: self.state.alignment.clone(),
-                        offset: self.state.horizontal_offset,
-                        print_area_width: self.state.print_area_width,
-                    });
+                            self.state.horizontal_offset = 0;
+                            self.pdf417_data.clear();
+                            self.log_debug("GS ( k PDF417: print");
+                        }
+                    }
+                    _ => {
+                        let skip = param_len.saturating_sub(2);
+                        i += skip.min(data.len() - i);
+                    }
+                }
+            }
+            49 => {
+                // QR Code commands (existing logic)
+                match fn_code {
+                    65 | 67 => {
+                        // 65: Set QR model, 67: Set module size
+                        if i < data.len() {
+                            if fn_code == 67 {
+                                self.qr_size = data[i];
+                            }
+                            i += 1;
+                        }
+                    }
+                    69 => {
+                        // Set error correction level
+                        if i < data.len() {
+                            self.qr_error_correction = data[i];
+                            i += 1;
+                        }
+                    }
+                    80 => {
+                        // Store QR data
+                        let data_len = param_len.saturating_sub(3);
+                        if i + data_len > data.len() {
+                            self.log_debug("GS ( k QR data incomplete");
+                            return Ok(start_i);
+                        }
+                        self.qr_data = data[i..i + data_len].to_vec();
+                        i += data_len;
+                    }
+                    81 => {
+                        // Print QR code
+                        if !self.qr_data.is_empty() {
+                            if !self.current_line.is_empty() {
+                                self.flush_line();
+                                self.current_line.clear();
+                            }
 
-                    // Reset horizontal offset after use
-                    self.state.horizontal_offset = 0;
+                            let qr_string =
+                                String::from_utf8_lossy(&self.qr_data).to_string();
+                            let size = (self.qr_size as usize).clamp(1, 16);
 
-                    self.qr_data.clear();
+                            self.elements.push(ReceiptElement::QrCode {
+                                data: qr_string,
+                                size,
+                                alignment: self.state.alignment.clone(),
+                                offset: self.state.horizontal_offset,
+                                print_area_width: self.state.print_area_width,
+                            });
+
+                            self.state.horizontal_offset = 0;
+                            self.qr_data.clear();
+                        }
+                    }
+                    _ => {
+                        let skip = param_len.saturating_sub(2);
+                        i += skip.min(data.len() - i);
+                    }
+                }
+            }
+            50 => {
+                // DataMatrix commands
+                match fn_code {
+                    65 => {
+                        // Symbol type (consume)
+                        if i < data.len() {
+                            i += 1;
+                        }
+                    }
+                    67 => {
+                        if i < data.len() {
+                            self.datamatrix_module_size = data[i].clamp(1, 8);
+                            self.log_debug(&format!(
+                                "GS ( k DataMatrix: module size = {}",
+                                self.datamatrix_module_size
+                            ));
+                            i += 1;
+                        }
+                    }
+                    80 => {
+                        let data_len = param_len.saturating_sub(3);
+                        if i + data_len > data.len() {
+                            self.log_debug("GS ( k DataMatrix data incomplete");
+                            return Ok(start_i);
+                        }
+                        self.datamatrix_data = data[i..i + data_len].to_vec();
+                        self.log_debug(&format!(
+                            "GS ( k DataMatrix: stored {} bytes",
+                            data_len
+                        ));
+                        i += data_len;
+                    }
+                    81 => {
+                        // Transmit size (skip)
+                        let skip = param_len.saturating_sub(2);
+                        i += skip.min(data.len() - i);
+                    }
+                    82 => {
+                        if !self.datamatrix_data.is_empty() {
+                            if !self.current_line.is_empty() {
+                                self.flush_line();
+                                self.current_line.clear();
+                            }
+
+                            self.elements.push(ReceiptElement::Barcode2D {
+                                data: self.datamatrix_data.clone(),
+                                variant: Barcode2DVariant::DataMatrix,
+                                module_size: self.datamatrix_module_size,
+                                alignment: self.state.alignment.clone(),
+                                offset: self.state.horizontal_offset,
+                                print_area_width: self.state.print_area_width,
+                            });
+
+                            self.state.horizontal_offset = 0;
+                            self.datamatrix_data.clear();
+                            self.log_debug("GS ( k DataMatrix: print");
+                        }
+                    }
+                    _ => {
+                        let skip = param_len.saturating_sub(2);
+                        i += skip.min(data.len() - i);
+                    }
                 }
             }
             _ => {
-                // Unknown QR function
                 let skip = param_len.saturating_sub(2);
                 i += skip.min(data.len() - i);
             }
@@ -2192,6 +2538,48 @@ impl eframe::App for VirtualEscPosApp {
                                                     printer_width_px,
                                                 );
                                             }
+                                            ReceiptElement::Barcode {
+                                                data,
+                                                barcode_type,
+                                                height,
+                                                module_width,
+                                                hri_position,
+                                                alignment,
+                                                offset,
+                                                print_area_width,
+                                            } => {
+                                                render_barcode(
+                                                    ui,
+                                                    data,
+                                                    barcode_type,
+                                                    *height,
+                                                    *module_width,
+                                                    hri_position,
+                                                    alignment,
+                                                    *offset,
+                                                    *print_area_width,
+                                                    printer_width_px,
+                                                );
+                                            }
+                                            ReceiptElement::Barcode2D {
+                                                data,
+                                                variant,
+                                                module_size,
+                                                alignment,
+                                                offset,
+                                                print_area_width,
+                                            } => {
+                                                render_barcode_2d(
+                                                    ui,
+                                                    data,
+                                                    variant,
+                                                    *module_size,
+                                                    alignment,
+                                                    *offset,
+                                                    *print_area_width,
+                                                    printer_width_px,
+                                                );
+                                            }
                                             ReceiptElement::PaperCut { cut_type } => {
                                                 ui.separator();
                                                 ui.horizontal(|ui| {
@@ -2435,6 +2823,249 @@ fn render_qr_code(
             ui.colored_label(egui::Color32::RED, format!("QR Code Error: {:?}", e));
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_barcode(
+    ui: &mut egui::Ui,
+    data: &[u8],
+    barcode_type: &BarcodeType,
+    height: u8,
+    module_width: u8,
+    hri_position: &HriPosition,
+    alignment: &Alignment,
+    offset: u16,
+    print_area_width: u16,
+    printer_width_px: f32,
+) {
+    let data_str = String::from_utf8_lossy(data);
+    let format = barcode_type.to_rxing_format();
+
+    let writer = MultiFormatWriter;
+    let bit_matrix = match writer.encode(&data_str, &format, 0, 0) {
+        Ok(matrix) => matrix,
+        Err(e) => {
+            ui.colored_label(
+                egui::Color32::RED,
+                format!("Barcode Error ({:?}): {}", barcode_type, e),
+            );
+            return;
+        }
+    };
+
+    let bar_width = bit_matrix.width() as usize;
+    let scale = module_width as usize;
+    let pixel_width = bar_width * scale;
+    let pixel_height = height as usize;
+
+    let hri_line_height: usize = 14;
+    let above_hri = matches!(hri_position, HriPosition::Above | HriPosition::Both);
+    let below_hri = matches!(hri_position, HriPosition::Below | HriPosition::Both);
+    let hri_above_h = if above_hri { hri_line_height } else { 0 };
+    let hri_below_h = if below_hri { hri_line_height } else { 0 };
+    let total_height = pixel_height + hri_above_h + hri_below_h;
+
+    let mut pixels = Vec::with_capacity(pixel_width * total_height);
+
+    // White space for HRI above
+    for _ in 0..(pixel_width * hri_above_h) {
+        pixels.push(egui::Color32::WHITE);
+    }
+
+    // Barcode bars
+    for _y in 0..pixel_height {
+        for x in 0..bar_width {
+            let color = if bit_matrix.get(x as u32, 0) {
+                egui::Color32::BLACK
+            } else {
+                egui::Color32::WHITE
+            };
+            for _ in 0..scale {
+                pixels.push(color);
+            }
+        }
+    }
+
+    // White space for HRI below
+    for _ in 0..(pixel_width * hri_below_h) {
+        pixels.push(egui::Color32::WHITE);
+    }
+
+    let image = egui::ColorImage {
+        size: [pixel_width, total_height],
+        pixels,
+    };
+
+    let texture = ui.ctx().load_texture(
+        format!(
+            "barcode_{:?}_{}",
+            barcode_type,
+            data_str.chars().take(20).collect::<String>()
+        ),
+        image,
+        egui::TextureOptions::NEAREST,
+    );
+
+    let effective_width = if print_area_width > 0 {
+        print_area_width as f32
+    } else {
+        printer_width_px
+    };
+
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(printer_width_px, total_height as f32),
+        egui::Sense::hover(),
+    );
+
+    let area_offset = if print_area_width > 0 {
+        (printer_width_px - print_area_width as f32) / 2.0
+    } else {
+        0.0
+    };
+
+    let base_x = match alignment {
+        Alignment::Left => 0.0,
+        Alignment::Center => area_offset + (effective_width - pixel_width as f32) / 2.0,
+        Alignment::Right => area_offset + effective_width - pixel_width as f32,
+    };
+
+    let final_x = if offset > 0 { offset as f32 } else { base_x };
+
+    let pos = egui::pos2(rect.left() + final_x, rect.top());
+    let size = egui::vec2(pixel_width as f32, total_height as f32);
+
+    ui.painter().image(
+        texture.id(),
+        egui::Rect::from_min_size(pos, size),
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
+
+    // Render HRI text overlay
+    if *hri_position != HriPosition::None {
+        let font_id = egui::FontId::monospace(10.0);
+        let text_galley =
+            ui.fonts(|f| f.layout_no_wrap(data_str.to_string(), font_id, egui::Color32::BLACK));
+        let text_width = text_galley.size().x;
+        let text_x = pos.x + (pixel_width as f32 - text_width) / 2.0;
+
+        if above_hri {
+            ui.painter().galley(
+                egui::pos2(text_x, pos.y + 1.0),
+                text_galley.clone(),
+                egui::Color32::BLACK,
+            );
+        }
+        if below_hri {
+            ui.painter().galley(
+                egui::pos2(text_x, pos.y + (total_height - hri_line_height) as f32 + 1.0),
+                text_galley,
+                egui::Color32::BLACK,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_barcode_2d(
+    ui: &mut egui::Ui,
+    data: &[u8],
+    variant: &Barcode2DVariant,
+    module_size: u8,
+    alignment: &Alignment,
+    offset: u16,
+    print_area_width: u16,
+    printer_width_px: f32,
+) {
+    let format = match variant {
+        Barcode2DVariant::Pdf417 => BarcodeFormat::PDF_417,
+        Barcode2DVariant::DataMatrix => BarcodeFormat::DATA_MATRIX,
+    };
+
+    let data_str = String::from_utf8_lossy(data);
+    let writer = MultiFormatWriter;
+    let bit_matrix = match writer.encode(&data_str, &format, 0, 0) {
+        Ok(matrix) => matrix,
+        Err(e) => {
+            ui.colored_label(
+                egui::Color32::RED,
+                format!("{:?} Error: {}", variant, e),
+            );
+            return;
+        }
+    };
+
+    let w = bit_matrix.width() as usize;
+    let h = bit_matrix.height() as usize;
+    let scale = module_size.max(1) as usize;
+    let pixel_width = w * scale;
+    let pixel_height = h * scale;
+
+    let mut pixels = Vec::with_capacity(pixel_width * pixel_height);
+    for y in 0..h {
+        for _ in 0..scale {
+            for x in 0..w {
+                let color = if bit_matrix.get(x as u32, y as u32) {
+                    egui::Color32::BLACK
+                } else {
+                    egui::Color32::WHITE
+                };
+                for _ in 0..scale {
+                    pixels.push(color);
+                }
+            }
+        }
+    }
+
+    let image = egui::ColorImage {
+        size: [pixel_width, pixel_height],
+        pixels,
+    };
+
+    let texture = ui.ctx().load_texture(
+        format!(
+            "{:?}_{}",
+            variant,
+            data_str.chars().take(20).collect::<String>()
+        ),
+        image,
+        egui::TextureOptions::NEAREST,
+    );
+
+    let effective_width = if print_area_width > 0 {
+        print_area_width as f32
+    } else {
+        printer_width_px
+    };
+
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(printer_width_px, pixel_height as f32),
+        egui::Sense::hover(),
+    );
+
+    let area_offset = if print_area_width > 0 {
+        (printer_width_px - print_area_width as f32) / 2.0
+    } else {
+        0.0
+    };
+
+    let base_x = match alignment {
+        Alignment::Left => 0.0,
+        Alignment::Center => area_offset + (effective_width - pixel_width as f32) / 2.0,
+        Alignment::Right => area_offset + effective_width - pixel_width as f32,
+    };
+
+    let final_x = if offset > 0 { offset as f32 } else { base_x };
+
+    let pos = egui::pos2(rect.left() + final_x, rect.top());
+    let size = egui::vec2(pixel_width as f32, pixel_height as f32);
+
+    ui.painter().image(
+        texture.id(),
+        egui::Rect::from_min_size(pos, size),
+        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+        egui::Color32::WHITE,
+    );
 }
 
 async fn handle_client(

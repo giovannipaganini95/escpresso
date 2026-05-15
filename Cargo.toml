@@ -27,3 +27,5 @@ encoding_rs = "0.8"
 qrcode = "0.14"
 oem_cp = "2"
 rxing = "0.9"
+clap = { version = "4", features = ["derive"] }
+image = "0.25"

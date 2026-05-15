@@ -1,4 +1,5 @@
 use anyhow::Result;
+use clap::Parser;
 use eframe::egui;
 use encoding_rs::Encoding;
 use oem_cp::code_table::DECODING_TABLE_CP_MAP;
@@ -267,6 +268,7 @@ struct EscPosRenderer {
     last_was_binary: bool,
     printer_status: Arc<Mutex<PrinterStatus>>,
     nv_images: Arc<Mutex<HashMap<u8, NvBitImage>>>,
+    command_log: Arc<Mutex<Vec<CommandLogEntry>>>,
 }
 
 impl EscPosRenderer {
@@ -274,6 +276,7 @@ impl EscPosRenderer {
         debug: bool,
         printer_status: Arc<Mutex<PrinterStatus>>,
         nv_images: Arc<Mutex<HashMap<u8, NvBitImage>>>,
+        command_log: Arc<Mutex<Vec<CommandLogEntry>>>,
     ) -> Self {
         Self {
             state: PrinterState::default(),
@@ -300,6 +303,7 @@ impl EscPosRenderer {
             last_was_binary: false,
             printer_status,
             nv_images,
+            command_log,
         }
     }
 
@@ -307,6 +311,13 @@ impl EscPosRenderer {
         if self.debug {
             eprintln!("[DEBUG] {}", msg);
         }
+    }
+
+    fn log_command(&self, hex: &str, description: &str) {
+        self.command_log.lock().unwrap().push(CommandLogEntry {
+            hex: hex.to_string(),
+            description: description.to_string(),
+        });
     }
 
     fn take_elements(&mut self) -> Vec<ReceiptElement> {
@@ -433,46 +444,48 @@ impl EscPosRenderer {
                     i += 1;
                 }
                 ESC => {
-                    // Enter command sequence - block text accumulation
                     self.in_command_sequence = true;
                     i += 1;
                     if i >= data.len() {
                         i = start_pos;
                         break;
                     }
+                    let cmd_byte = data[i];
                     match self.handle_esc_command(&data, i) {
                         Ok(new_i) => {
                             if new_i == i || new_i <= start_pos {
-                                // Handler didn't make progress - waiting for more data
                                 i = start_pos;
-                                // Keep in_command_sequence = true
                                 break;
                             }
+                            self.log_command(
+                                &format!("1B {:02X}", cmd_byte),
+                                &format!("ESC {}", cmd_byte as char),
+                            );
                             i = new_i;
-                            // Command fully processed - allow text accumulation again
                             self.in_command_sequence = false;
                         }
                         Err(e) => return Err(e),
                     }
                 }
                 GS => {
-                    // Enter command sequence - block text accumulation
                     self.in_command_sequence = true;
                     i += 1;
                     if i >= data.len() {
                         i = start_pos;
                         break;
                     }
+                    let cmd_byte = data[i];
                     match self.handle_gs_command(&data, i) {
                         Ok(new_i) => {
                             if new_i == i || new_i <= start_pos {
-                                // Handler didn't make progress - waiting for more data
                                 i = start_pos;
-                                // Keep in_command_sequence = true
                                 break;
                             }
+                            self.log_command(
+                                &format!("1D {:02X}", cmd_byte),
+                                &format!("GS {}", cmd_byte as char),
+                            );
                             i = new_i;
-                            // Command fully processed - allow text accumulation again
                             self.in_command_sequence = false;
                         }
                         Err(e) => return Err(e),
@@ -623,6 +636,10 @@ impl EscPosRenderer {
                         }
                     }
                     // Command processed - allow text accumulation again
+                    self.log_command(
+                        &format!("1C {:02X}", cmd),
+                        &format!("FS {}", cmd as char),
+                    );
                     self.in_command_sequence = false;
                 }
                 LF => {
@@ -2220,6 +2237,12 @@ struct NvBitImage {
     data: Vec<u8>,
 }
 
+#[derive(Debug, Clone)]
+struct CommandLogEntry {
+    hex: String,
+    description: String,
+}
+
 #[derive(Clone)]
 struct AppState {
     elements: Arc<Mutex<Vec<ReceiptElement>>>,
@@ -2227,33 +2250,73 @@ struct AppState {
     paper_size: Arc<Mutex<PaperSize>>,
     printer_status: Arc<Mutex<PrinterStatus>>,
     nv_images: Arc<Mutex<HashMap<u8, NvBitImage>>>,
+    command_log: Arc<Mutex<Vec<CommandLogEntry>>>,
+    port: u16,
 }
 
 impl AppState {
-    fn new() -> Self {
+    fn new(port: u16) -> Self {
         Self {
             elements: Arc::new(Mutex::new(Vec::new())),
             connections: Arc::new(Mutex::new(Vec::new())),
             paper_size: Arc::new(Mutex::new(PaperSize::Size80mm)),
             printer_status: Arc::new(Mutex::new(PrinterStatus::default())),
             nv_images: Arc::new(Mutex::new(HashMap::new())),
+            command_log: Arc::new(Mutex::new(Vec::new())),
+            port,
         }
     }
 }
 
 struct VirtualEscPosApp {
     state: AppState,
+    inspector_open: bool,
+    export_status: Option<String>,
 }
 
 impl VirtualEscPosApp {
     fn new(_cc: &eframe::CreationContext, state: AppState) -> Self {
-        Self { state }
+        Self {
+            state,
+            inspector_open: false,
+            export_status: None,
+        }
     }
 }
 
 impl eframe::App for VirtualEscPosApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint();
+
+        // Handle screenshot events
+        ctx.input(|i| {
+            for event in &i.raw.events {
+                if let egui::Event::Screenshot { image, .. } = event {
+                    let width = image.width();
+                    let height = image.height();
+                    let pixels: Vec<u8> = image
+                        .pixels
+                        .iter()
+                        .flat_map(|c| [c.r(), c.g(), c.b(), c.a()])
+                        .collect();
+                    if let Some(img_buf) =
+                        image::RgbaImage::from_raw(width as u32, height as u32, pixels)
+                    {
+                        let path = "escpresso_receipt.png";
+                        match img_buf.save(path) {
+                            Ok(()) => {
+                                self.export_status =
+                                    Some(format!("Saved: {}", path));
+                            }
+                            Err(e) => {
+                                self.export_status =
+                                    Some(format!("Error: {}", e));
+                            }
+                        }
+                    }
+                }
+            }
+        });
 
         // Force light mode, ignoring OS dark mode
         ctx.set_visuals(egui::Visuals::light());
@@ -2422,8 +2485,45 @@ impl eframe::App for VirtualEscPosApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.colored_label(
                             egui::Color32::DARK_GRAY,
-                            format!("{}cpl | :9100", current_paper_size.chars_per_line()),
+                            format!("{}cpl | :{}", current_paper_size.chars_per_line(), self.state.port),
                         );
+
+                        if let Some(ref status_msg) = self.export_status {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0, 140, 0),
+                                egui::RichText::new(status_msg.as_str()).small(),
+                            );
+                        }
+
+                        let export_btn = egui::Button::new(
+                            egui::RichText::new("Export PNG").small(),
+                        )
+                        .fill(neutral_bg)
+                        .rounding(egui::Rounding::same(rounding))
+                        .min_size(egui::vec2(0.0, widget_height));
+                        if ui.add(export_btn).clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot);
+                        }
+
+                        let inspector_label = if self.inspector_open {
+                            "Inspector ON"
+                        } else {
+                            "Inspector"
+                        };
+                        let inspector_color = if self.inspector_open {
+                            egui::Color32::from_rgb(200, 220, 255)
+                        } else {
+                            neutral_bg
+                        };
+                        let inspector_btn = egui::Button::new(
+                            egui::RichText::new(inspector_label).small(),
+                        )
+                        .fill(inspector_color)
+                        .rounding(egui::Rounding::same(rounding))
+                        .min_size(egui::vec2(0.0, widget_height));
+                        if ui.add(inspector_btn).clicked() {
+                            self.inspector_open = !self.inspector_open;
+                        }
                     });
                 });
             });
@@ -2431,6 +2531,63 @@ impl eframe::App for VirtualEscPosApp {
         // Clear receipt when paper size changes
         if paper_size_changed {
             self.state.elements.lock().unwrap().clear();
+        }
+
+        // Command inspector side panel
+        if self.inspector_open {
+            egui::SidePanel::right("inspector")
+                .default_width(280.0)
+                .min_width(200.0)
+                .frame(
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_gray(250))
+                        .inner_margin(6.0)
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_gray(200))),
+                )
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.strong("Command Inspector");
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center),
+                            |ui| {
+                                if ui.small_button("Clear").clicked() {
+                                    self.state.command_log.lock().unwrap().clear();
+                                }
+                            },
+                        );
+                    });
+                    ui.separator();
+
+                    let log = self.state.command_log.lock().unwrap();
+                    let row_height = 16.0;
+                    let total_rows = log.len();
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .stick_to_bottom(true)
+                        .show_rows(ui, row_height, total_rows, |ui, row_range| {
+                            for idx in row_range {
+                                if let Some(entry) = log.get(idx) {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!("{:4}", idx + 1))
+                                                .small()
+                                                .color(egui::Color32::GRAY),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(&entry.hex)
+                                                .small()
+                                                .monospace()
+                                                .color(egui::Color32::from_rgb(0, 100, 180)),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(&entry.description)
+                                                .small(),
+                                        );
+                                    });
+                                }
+                            }
+                        });
+                });
         }
 
         egui::CentralPanel::default()
@@ -3324,6 +3481,7 @@ async fn handle_client(
         debug,
         state.printer_status.clone(),
         state.nv_images.clone(),
+        state.command_log.clone(),
     );
     let mut buffer = vec![0u8; 8192];
 
@@ -3395,27 +3553,38 @@ async fn handle_client(
     Ok(())
 }
 
+#[derive(Parser)]
+#[command(name = "escpresso", about = "Virtual ESC/POS thermal receipt printer emulator")]
+struct Args {
+    #[arg(short, long, default_value_t = 9100)]
+    port: u16,
+
+    #[arg(short, long)]
+    debug: bool,
+}
+
 fn main() -> Result<()> {
-    let debug = std::env::var("DEBUG").is_ok();
-    let state = AppState::new();
+    let args = Args::parse();
+    let debug = args.debug || std::env::var("DEBUG").is_ok();
+    let port = args.port;
+    let state = AppState::new(port);
     let state_clone = state.clone();
 
     std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let listener = match TcpListener::bind("0.0.0.0:9100").await {
+            let listener = match TcpListener::bind(format!("0.0.0.0:{}", port)).await {
                 Ok(listener) => listener,
                 Err(e) => {
-                    eprintln!("ERROR: Failed to bind to port 9100: {}", e);
-                    eprintln!("Port 9100 is already in use. Please:");
+                    eprintln!("ERROR: Failed to bind to port {}: {}", port, e);
+                    eprintln!("Port {} is already in use. Please:", port);
                     eprintln!("  1. Stop any other escpresso instances");
-                    eprintln!("  2. Check for other applications using port 9100:");
-                    eprintln!("     lsof -i :9100");
-                    eprintln!("     netstat -tulpn | grep 9100");
+                    eprintln!("  2. Check for other applications using port {}:", port);
+                    eprintln!("     lsof -i :{}", port);
                     std::process::exit(1);
                 }
             };
-            println!("TCP Server listening on 0.0.0.0:9100");
+            println!("TCP Server listening on 0.0.0.0:{}", port);
             if debug {
                 eprintln!("[DEBUG] Debug mode enabled");
             }

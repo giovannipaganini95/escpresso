@@ -159,8 +159,8 @@ Other control characters (0x00-0x1F) are silently ignored.
 | Command | Hex | Description | Status |
 |---------|-----|-------------|--------|
 | FS .    | 1C 2E n | Cancel user-defined character | ✅ Implemented (consumed) |
-| FS p    | 1C 70 n m | Print NV bit image | ✅ Implemented (consumed) |
-| FS q    | 1C 71 n m | Define NV bit image | ✅ Implemented (consumed) |
+| FS p    | 1C 70 n m | Print NV bit image | ✅ Implemented (renders stored NV image) |
+| FS q    | 1C 71 n m | Define NV bit image | ✅ Implemented (stores image data) |
 | FS C    | 1C 43 n | Select Kanji character mode | ✅ Implemented (consumed) |
 | FS g    | 1C 67 n | Select Kanji character code system | ✅ Implemented (consumed) |
 | FS !    | 1C 21 n | Set Kanji character mode | ✅ Implemented (consumed) |

@@ -4,6 +4,7 @@ use encoding_rs::Encoding;
 use oem_cp::code_table::DECODING_TABLE_CP_MAP;
 use qrcode::{Color as QrColor, QrCode};
 use rxing::{BarcodeFormat, MultiFormatWriter, Writer};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -243,7 +244,7 @@ fn escpos_to_windows_cp(escpos_cp: u8) -> Option<u16> {
 
 struct EscPosRenderer {
     state: PrinterState,
-    current_line: Vec<u8>, // Store raw bytes, decode using current encoding when flushing
+    current_line: Vec<u8>,
     debug: bool,
     buffer: Vec<u8>,
     elements: Vec<ReceiptElement>,
@@ -263,11 +264,17 @@ struct EscPosRenderer {
     datamatrix_data: Vec<u8>,
     datamatrix_module_size: u8,
     response_queue: Vec<u8>,
-    last_was_binary: bool, // Track if last command was binary (raster, etc.)
+    last_was_binary: bool,
+    printer_status: Arc<Mutex<PrinterStatus>>,
+    nv_images: Arc<Mutex<HashMap<u8, NvBitImage>>>,
 }
 
 impl EscPosRenderer {
-    fn new(debug: bool) -> Self {
+    fn new(
+        debug: bool,
+        printer_status: Arc<Mutex<PrinterStatus>>,
+        nv_images: Arc<Mutex<HashMap<u8, NvBitImage>>>,
+    ) -> Self {
         Self {
             state: PrinterState::default(),
             current_line: Vec::new(),
@@ -291,6 +298,8 @@ impl EscPosRenderer {
             datamatrix_module_size: 3,
             response_queue: Vec::new(),
             last_was_binary: false,
+            printer_status,
+            nv_images,
         }
     }
 
@@ -337,14 +346,23 @@ impl EscPosRenderer {
                                 let _n = data[i];
                                 i += 1;
 
-                                // Queue status response: 0x12 = online, no errors
-                                // Bit format: 00010010
-                                //   Bit 3 = 1: Paper present
-                                //   Bit 4 = 1: Online
-                                self.response_queue.push(0x12);
-                                self.log_debug(
-                                    "DLE EOT/ENQ: queued status response 0x12 (online, no errors)",
-                                );
+                                let status = self.printer_status.lock().unwrap();
+                                let mut byte: u8 = 0x12; // base: online, paper present
+                                if !status.paper_present {
+                                    byte &= !0x08; // clear bit 3: paper out
+                                }
+                                if !status.cover_closed {
+                                    byte |= 0x20; // set bit 5: cover open
+                                }
+                                if !status.online {
+                                    byte &= !0x10; // clear bit 4: offline
+                                }
+                                drop(status);
+                                self.response_queue.push(byte);
+                                self.log_debug(&format!(
+                                    "DLE EOT/ENQ: queued status 0x{:02X}",
+                                    byte
+                                ));
                             }
                         }
                         0x14 => {
@@ -484,25 +502,84 @@ impl EscPosRenderer {
                             }
                         }
                         b'p' => {
-                            // FS p n m - Print NV bit image - 2 parameters
+                            // FS p n m - Print NV bit image
                             if i + 1 < data.len() {
+                                let slot = data[i];
+                                let _mode = data[i + 1];
                                 i += 2;
+
+                                let img_clone = self
+                                    .nv_images
+                                    .lock()
+                                    .unwrap()
+                                    .get(&slot)
+                                    .cloned();
+
+                                if let Some(img) = img_clone {
+                                    if !self.current_line.is_empty() {
+                                        self.flush_line();
+                                        self.current_line.clear();
+                                    }
+                                    let bytes_per_line = img.width.div_ceil(8);
+                                    self.elements.push(ReceiptElement::RasterImage {
+                                        width: img.width,
+                                        height: img.height,
+                                        data: img.data,
+                                        offset: self.state.horizontal_offset,
+                                        density: self.state.print_density,
+                                        alignment: self.state.alignment.clone(),
+                                        bytes_per_line,
+                                        print_area_width: self.state.print_area_width,
+                                    });
+                                    self.state.horizontal_offset = 0;
+                                    self.log_debug(&format!(
+                                        "FS p: rendered NV image slot {}",
+                                        slot
+                                    ));
+                                } else {
+                                    self.log_debug(&format!(
+                                        "FS p: NV image slot {} not defined",
+                                        slot
+                                    ));
+                                }
                             }
                         }
                         b'q' => {
-                            // FS q n [xL xH yL yH d1...dk] - Define NV bit image
+                            // FS q n [xL xH yL yH d1...dk]... - Define NV bit image
                             if i < data.len() {
                                 let n = data[i];
                                 i += 1;
-                                if n > 0 && i + 4 < data.len() {
+                                for slot in 1..=n {
+                                    if i + 3 >= data.len() {
+                                        break;
+                                    }
                                     let xl = data[i] as usize;
                                     let xh = data[i + 1] as usize;
                                     let yl = data[i + 2] as usize;
                                     let yh = data[i + 3] as usize;
-                                    let width = xl + (xh << 8);
+                                    let width_bytes = xl + (xh << 8);
                                     let height = yl + (yh << 8);
-                                    let data_size = width.div_ceil(8) * height;
-                                    i += 4 + data_size.min(data.len() - i);
+                                    let width = width_bytes * 8;
+                                    let data_size = width_bytes * height;
+                                    i += 4;
+
+                                    if i + data_size <= data.len() && data_size > 0 {
+                                        let img_data =
+                                            data[i..i + data_size].to_vec();
+                                        self.nv_images.lock().unwrap().insert(
+                                            slot,
+                                            NvBitImage {
+                                                width,
+                                                height,
+                                                data: img_data,
+                                            },
+                                        );
+                                        self.log_debug(&format!(
+                                            "FS q: stored NV image slot {} ({}x{})",
+                                            slot, width, height
+                                        ));
+                                    }
+                                    i += data_size.min(data.len() - i);
                                 }
                             }
                         }
@@ -773,6 +850,7 @@ impl EscPosRenderer {
                     let pin = data[i];
                     let on_time = data[i + 1];
                     let off_time = data[i + 2];
+                    self.printer_status.lock().unwrap().drawer_open = true;
                     self.elements.push(ReceiptElement::CashDrawer {
                         pin,
                         on_time,
@@ -1316,31 +1394,39 @@ impl EscPosRenderer {
             }
             b'a' => {
                 // GS a n - Enable/disable Automatic Status Back (ASB)
-                // n bits specify which status types to report automatically
                 i += 1;
                 if i < data.len() {
                     let asb_flags = data[i];
                     self.log_debug(&format!("GS a: ASB flags=0x{:02X}", asb_flags));
 
-                    // If ASB is enabled (n != 0), send 4-byte ASB status immediately
                     if asb_flags != 0 {
-                        // ASB format (4 bytes):
-                        // Byte 0: 0x10 = binary 00010000
-                        //   Bit 0,1 = 0 (fixed)
-                        //   Bit 2 = 0 (drawer pin LOW)
-                        //   Bit 3 = 0 (online)
-                        //   Bit 4 = 1 (fixed)
-                        //   Bit 5 = 0 (cover closed)
-                        //   Bit 6 = 0 (not feeding paper)
-                        //   Bit 7 = 0 (fixed)
-                        // Byte 1: 0x00 = all OK (no errors, not waiting)
-                        // Byte 2: 0x00 = paper sensors OK (paper present)
-                        // Byte 3: 0x00 = reserved
-                        self.response_queue.push(0x10);
-                        self.response_queue.push(0x00);
-                        self.response_queue.push(0x00);
-                        self.response_queue.push(0x00);
-                        self.log_debug("GS a: queued 4-byte ASB status (online, no errors)");
+                        let status = self.printer_status.lock().unwrap();
+                        // Byte 0: bit 2=drawer, bit 3=offline, bit 4=1(fixed), bit 5=cover
+                        let mut b0: u8 = 0x10; // bit 4 fixed
+                        if status.drawer_open {
+                            b0 |= 0x04; // bit 2
+                        }
+                        if !status.online {
+                            b0 |= 0x08; // bit 3: offline
+                        }
+                        if !status.cover_closed {
+                            b0 |= 0x20; // bit 5: cover open
+                        }
+                        // Byte 2: bit 0-1 = paper near-end, bit 2-3 = paper out
+                        let mut b2: u8 = 0x00;
+                        if !status.paper_present {
+                            b2 |= 0x0C; // bits 2-3: paper out
+                        }
+                        drop(status);
+
+                        self.response_queue.push(b0);
+                        self.response_queue.push(0x00); // byte 1: no errors
+                        self.response_queue.push(b2);
+                        self.response_queue.push(0x00); // byte 3: reserved
+                        self.log_debug(&format!(
+                            "GS a: queued ASB [{:02X} 00 {:02X} 00]",
+                            b0, b2
+                        ));
                     }
                     i += 1;
                 }
@@ -1386,14 +1472,17 @@ impl EscPosRenderer {
                     let _n = data[i];
                     self.log_debug(&format!("GS r: transmit status n=0x{:02X}", _n));
 
-                    // Send 1-byte status response
-                    // Status byte format: bit pattern must have (value & 0x90) === 0
-                    // 0x08 = 00001000 (online, paper present, no errors)
-                    //   Bit 3 = 1: paper present
-                    //   Bit 4 = 0: online (not offline)
-                    //   Bit 7 = 0: (required by receiptio)
-                    self.response_queue.push(0x08);
-                    self.log_debug("GS r: queued status response 0x08 (online, paper OK)");
+                    let status = self.printer_status.lock().unwrap();
+                    let mut byte: u8 = 0x00;
+                    if status.paper_present {
+                        byte |= 0x08; // bit 3: paper present
+                    }
+                    if !status.online {
+                        byte |= 0x10; // bit 4: offline
+                    }
+                    drop(status);
+                    self.response_queue.push(byte);
+                    self.log_debug(&format!("GS r: queued status 0x{:02X}", byte));
                     i += 1;
                 }
             }
@@ -2106,11 +2195,38 @@ impl EscPosRenderer {
     }
 }
 
+struct PrinterStatus {
+    paper_present: bool,
+    cover_closed: bool,
+    drawer_open: bool,
+    online: bool,
+}
+
+impl Default for PrinterStatus {
+    fn default() -> Self {
+        Self {
+            paper_present: true,
+            cover_closed: true,
+            drawer_open: false,
+            online: true,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct NvBitImage {
+    width: usize,
+    height: usize,
+    data: Vec<u8>,
+}
+
 #[derive(Clone)]
 struct AppState {
     elements: Arc<Mutex<Vec<ReceiptElement>>>,
     connections: Arc<Mutex<Vec<String>>>,
     paper_size: Arc<Mutex<PaperSize>>,
+    printer_status: Arc<Mutex<PrinterStatus>>,
+    nv_images: Arc<Mutex<HashMap<u8, NvBitImage>>>,
 }
 
 impl AppState {
@@ -2119,6 +2235,8 @@ impl AppState {
             elements: Arc::new(Mutex::new(Vec::new())),
             connections: Arc::new(Mutex::new(Vec::new())),
             paper_size: Arc::new(Mutex::new(PaperSize::Size80mm)),
+            printer_status: Arc::new(Mutex::new(PrinterStatus::default())),
+            nv_images: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -2167,45 +2285,47 @@ impl eframe::App for VirtualEscPosApp {
             .frame(
                 egui::Frame::none()
                     .fill(egui::Color32::WHITE)
-                    .inner_margin(4.0),
+                    .inner_margin(egui::Margin::symmetric(8.0, 5.0)),
             )
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
+
+                    let widget_height = 22.0;
+                    let rounding = 4.0;
+
+                    // Shared style for neutral widgets (combo box, clear button)
+                    let neutral_bg = egui::Color32::from_gray(240);
+                    let neutral_hover = egui::Color32::from_gray(225);
+                    let neutral_active = egui::Color32::from_gray(210);
+
                     ui.scope(|ui| {
                         let style = ui.style_mut();
-                        // Dropdown button (inactive state)
-                        style.visuals.widgets.inactive.weak_bg_fill = egui::Color32::from_gray(245);
-                        style.visuals.widgets.inactive.bg_fill = egui::Color32::from_gray(245);
-                        style.visuals.widgets.inactive.fg_stroke.color = egui::Color32::BLACK;
-
-                        // Noninteractive (selected items with checkmark)
-                        style.visuals.widgets.noninteractive.weak_bg_fill =
-                            egui::Color32::from_gray(248);
-                        style.visuals.widgets.noninteractive.bg_fill =
-                            egui::Color32::from_gray(248);
-                        style.visuals.widgets.noninteractive.fg_stroke.color = egui::Color32::BLACK;
-
-                        // Hover state
-                        style.visuals.widgets.hovered.weak_bg_fill = egui::Color32::from_gray(250);
-                        style.visuals.widgets.hovered.bg_fill = egui::Color32::from_gray(250);
+                        let r = egui::Rounding::same(rounding);
+                        for w in [
+                            &mut style.visuals.widgets.inactive,
+                            &mut style.visuals.widgets.noninteractive,
+                            &mut style.visuals.widgets.open,
+                        ] {
+                            w.weak_bg_fill = neutral_bg;
+                            w.bg_fill = neutral_bg;
+                            w.fg_stroke.color = egui::Color32::BLACK;
+                            w.rounding = r;
+                        }
+                        style.visuals.widgets.hovered.weak_bg_fill = neutral_hover;
+                        style.visuals.widgets.hovered.bg_fill = neutral_hover;
                         style.visuals.widgets.hovered.fg_stroke.color = egui::Color32::BLACK;
-
-                        // Active/clicked state
-                        style.visuals.widgets.active.weak_bg_fill = egui::Color32::from_gray(240);
-                        style.visuals.widgets.active.bg_fill = egui::Color32::from_gray(240);
+                        style.visuals.widgets.hovered.rounding = r;
+                        style.visuals.widgets.active.weak_bg_fill = neutral_active;
+                        style.visuals.widgets.active.bg_fill = neutral_active;
                         style.visuals.widgets.active.fg_stroke.color = egui::Color32::BLACK;
-
-                        // Open state
-                        style.visuals.widgets.open.weak_bg_fill = egui::Color32::from_gray(250);
-                        style.visuals.widgets.open.bg_fill = egui::Color32::from_gray(250);
-                        style.visuals.widgets.open.fg_stroke.color = egui::Color32::BLACK;
-
-                        // Selection highlight
-                        style.visuals.selection.bg_fill = egui::Color32::from_gray(248);
+                        style.visuals.widgets.active.rounding = r;
+                        style.visuals.selection.bg_fill = egui::Color32::from_gray(232);
                         style.visuals.selection.stroke.color = egui::Color32::BLACK;
 
                         egui::ComboBox::from_id_salt("paper_size")
                             .selected_text(current_paper_size.label())
+                            .height(widget_height)
                             .show_ui(ui, |ui| {
                                 if ui
                                     .selectable_value(
@@ -2238,31 +2358,66 @@ impl eframe::App for VirtualEscPosApp {
                                     }
                                 }
                             });
-                    });
 
-                    ui.separator();
-
-                    // Clear button
-                    ui.scope(|ui| {
-                        let style = ui.style_mut();
-                        style.visuals.widgets.inactive.weak_bg_fill =
-                            egui::Color32::from_rgb(245, 245, 245);
-                        style.visuals.widgets.inactive.bg_fill =
-                            egui::Color32::from_rgb(245, 245, 245);
-                        style.visuals.widgets.inactive.fg_stroke.color = egui::Color32::BLACK;
-                        style.visuals.widgets.hovered.weak_bg_fill =
-                            egui::Color32::from_rgb(230, 230, 230);
-                        style.visuals.widgets.hovered.bg_fill =
-                            egui::Color32::from_rgb(230, 230, 230);
-                        style.visuals.widgets.active.weak_bg_fill =
-                            egui::Color32::from_rgb(210, 210, 210);
-                        style.visuals.widgets.active.bg_fill =
-                            egui::Color32::from_rgb(210, 210, 210);
-
-                        if ui.button("Clear").clicked() {
+                        let clear_btn = egui::Button::new("Clear")
+                            .min_size(egui::vec2(0.0, widget_height));
+                        if ui.add(clear_btn).clicked() {
                             self.state.elements.lock().unwrap().clear();
                         }
                     });
+
+                    ui.add(egui::Separator::default().spacing(8.0));
+
+                    // Printer status toggles
+                    {
+                        let mut status = self.state.printer_status.lock().unwrap();
+                        let r = egui::Rounding::same(rounding);
+
+                        let (paper_color, paper_label) = if status.paper_present {
+                            (egui::Color32::from_rgb(200, 240, 200), "Paper: OK")
+                        } else {
+                            (egui::Color32::from_rgb(255, 180, 180), "Paper: OUT")
+                        };
+                        let paper_btn = egui::Button::new(
+                            egui::RichText::new(paper_label).small(),
+                        )
+                        .fill(paper_color)
+                        .rounding(r)
+                        .min_size(egui::vec2(0.0, widget_height));
+                        if ui.add(paper_btn).clicked() {
+                            status.paper_present = !status.paper_present;
+                        }
+
+                        let (cover_color, cover_label) = if status.cover_closed {
+                            (egui::Color32::from_rgb(200, 240, 200), "Cover: Closed")
+                        } else {
+                            (egui::Color32::from_rgb(255, 180, 180), "Cover: Open")
+                        };
+                        let cover_btn = egui::Button::new(
+                            egui::RichText::new(cover_label).small(),
+                        )
+                        .fill(cover_color)
+                        .rounding(r)
+                        .min_size(egui::vec2(0.0, widget_height));
+                        if ui.add(cover_btn).clicked() {
+                            status.cover_closed = !status.cover_closed;
+                        }
+
+                        let (drawer_color, drawer_label) = if status.drawer_open {
+                            (egui::Color32::from_rgb(255, 220, 150), "Drawer: Open")
+                        } else {
+                            (egui::Color32::from_rgb(200, 240, 200), "Drawer: Closed")
+                        };
+                        let drawer_btn = egui::Button::new(
+                            egui::RichText::new(drawer_label).small(),
+                        )
+                        .fill(drawer_color)
+                        .rounding(r)
+                        .min_size(egui::vec2(0.0, widget_height));
+                        if ui.add(drawer_btn).clicked() {
+                            status.drawer_open = !status.drawer_open;
+                        }
+                    }
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.colored_label(
@@ -2581,30 +2736,116 @@ impl eframe::App for VirtualEscPosApp {
                                                 );
                                             }
                                             ReceiptElement::PaperCut { cut_type } => {
-                                                ui.separator();
-                                                ui.horizontal(|ui| {
-                                                    ui.label("✂");
-                                                    ui.strong(format!("PAPER CUT: {}", cut_type));
+                                                ui.add_space(8.0);
+                                                let (rect, _) = ui.allocate_exact_size(
+                                                    egui::vec2(printer_width_px, 16.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                let painter = ui.painter();
+                                                let y = rect.center().y;
+                                                let is_partial =
+                                                    cut_type.contains("PARTIAL");
+                                                let dash_len = if is_partial {
+                                                    6.0
+                                                } else {
+                                                    10.0
+                                                };
+                                                let gap_len = 4.0;
+                                                let color = if is_partial {
+                                                    egui::Color32::from_gray(160)
+                                                } else {
+                                                    egui::Color32::from_gray(80)
+                                                };
+
+                                                let mut x = rect.left();
+                                                while x < rect.right() {
+                                                    let end =
+                                                        (x + dash_len).min(rect.right());
+                                                    painter.line_segment(
+                                                        [
+                                                            egui::pos2(x, y),
+                                                            egui::pos2(end, y),
+                                                        ],
+                                                        egui::Stroke::new(1.5, color),
+                                                    );
+                                                    x += dash_len + gap_len;
+                                                }
+
+                                                let label = egui::RichText::new(format!(
+                                                    "  {}  ",
+                                                    cut_type
+                                                ))
+                                                .small()
+                                                .color(color);
+                                                let label_galley = ui.fonts(|f| {
+                                                    f.layout_no_wrap(
+                                                        format!("  {}  ", cut_type),
+                                                        egui::FontId::proportional(9.0),
+                                                        color,
+                                                    )
                                                 });
-                                                ui.separator();
+                                                let label_w = label_galley.size().x;
+                                                let label_x = rect.center().x - label_w / 2.0;
+                                                painter.rect_filled(
+                                                    egui::Rect::from_min_size(
+                                                        egui::pos2(label_x - 2.0, y - 6.0),
+                                                        egui::vec2(label_w + 4.0, 12.0),
+                                                    ),
+                                                    0.0,
+                                                    egui::Color32::WHITE,
+                                                );
+                                                painter.galley(
+                                                    egui::pos2(label_x, y - 5.0),
+                                                    label_galley,
+                                                    color,
+                                                );
+                                                let _ = label;
+                                                ui.add_space(8.0);
                                             }
                                             ReceiptElement::CashDrawer {
                                                 pin,
                                                 on_time,
                                                 off_time,
                                             } => {
-                                                ui.separator();
-                                                ui.horizontal(|ui| {
-                                                    ui.label("💰");
-                                                    ui.strong("CASH DRAWER OPEN");
-                                                });
-                                                ui.label(format!(
-                                                    "Pin: {}  On: {}ms  Off: {}ms",
+                                                ui.add_space(4.0);
+                                                let (rect, _) = ui.allocate_exact_size(
+                                                    egui::vec2(printer_width_px, 28.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                let painter = ui.painter();
+                                                let bg_color =
+                                                    egui::Color32::from_rgb(255, 243, 220);
+                                                let border_color =
+                                                    egui::Color32::from_rgb(200, 160, 80);
+                                                painter.rect(
+                                                    rect,
+                                                    2.0,
+                                                    bg_color,
+                                                    egui::Stroke::new(1.0, border_color),
+                                                );
+                                                let text = format!(
+                                                    "CASH DRAWER  Pin:{}  On:{}ms  Off:{}ms",
                                                     pin,
                                                     *on_time as u32 * 2,
                                                     *off_time as u32 * 2
-                                                ));
-                                                ui.separator();
+                                                );
+                                                let galley = ui.fonts(|f| {
+                                                    f.layout_no_wrap(
+                                                        text,
+                                                        egui::FontId::monospace(10.0),
+                                                        egui::Color32::from_rgb(140, 100, 20),
+                                                    )
+                                                });
+                                                let text_x = rect.center().x
+                                                    - galley.size().x / 2.0;
+                                                let text_y = rect.center().y
+                                                    - galley.size().y / 2.0;
+                                                painter.galley(
+                                                    egui::pos2(text_x, text_y),
+                                                    galley,
+                                                    egui::Color32::from_rgb(140, 100, 20),
+                                                );
+                                                ui.add_space(4.0);
                                             }
                                             ReceiptElement::Separator => {
                                                 ui.add_space(4.0);
@@ -3079,7 +3320,11 @@ async fn handle_client(
         connections.push(format!("Connected: {}", addr));
     }
 
-    let mut renderer = EscPosRenderer::new(debug);
+    let mut renderer = EscPosRenderer::new(
+        debug,
+        state.printer_status.clone(),
+        state.nv_images.clone(),
+    );
     let mut buffer = vec![0u8; 8192];
 
     // Open file for raw data capture if debug enabled

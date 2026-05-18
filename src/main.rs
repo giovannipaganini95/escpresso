@@ -2015,6 +2015,12 @@ impl EscPosRenderer {
                         }
                     }
                     80 => {
+                        // Store PDF417 data: pL pH cn fn m d1...dk, skip m
+                        if i >= data.len() {
+                            self.log_debug("GS ( k PDF417 data incomplete (no m byte)");
+                            return Ok(start_i);
+                        }
+                        i += 1; // skip m byte
                         let data_len = param_len.saturating_sub(3);
                         if i + data_len > data.len() {
                             self.log_debug("GS ( k PDF417 data incomplete");
@@ -2033,6 +2039,9 @@ impl EscPosRenderer {
                         i += skip.min(data.len() - i);
                     }
                     82 => {
+                        // Print PDF417: pL pH cn fn m, skip m
+                        let skip = param_len.saturating_sub(2);
+                        i += skip.min(data.len() - i);
                         if !self.pdf417_data.is_empty() {
                             if !self.current_line.is_empty() {
                                 self.flush_line();
@@ -2062,12 +2071,15 @@ impl EscPosRenderer {
             49 => {
                 // QR Code commands (existing logic)
                 match fn_code {
-                    65 | 67 => {
-                        // 65: Set QR model, 67: Set module size
+                    65 => {
+                        // Set QR model: params are n1 n2 (2 bytes)
+                        let skip = (param_len.saturating_sub(2)).min(data.len() - i);
+                        i += skip;
+                    }
+                    67 => {
+                        // Set module size: param is n (1 byte)
                         if i < data.len() {
-                            if fn_code == 67 {
-                                self.qr_size = data[i];
-                            }
+                            self.qr_size = data[i];
                             i += 1;
                         }
                     }
@@ -2079,7 +2091,13 @@ impl EscPosRenderer {
                         }
                     }
                     80 => {
-                        // Store QR data
+                        // Store QR data: pL pH cn fn m d1...dk
+                        // param_len includes cn+fn+m+data, i is past cn+fn, skip m
+                        if i >= data.len() {
+                            self.log_debug("GS ( k QR data incomplete (no m byte)");
+                            return Ok(start_i);
+                        }
+                        i += 1; // skip m (encoding mode byte)
                         let data_len = param_len.saturating_sub(3);
                         if i + data_len > data.len() {
                             self.log_debug("GS ( k QR data incomplete");
@@ -2089,7 +2107,9 @@ impl EscPosRenderer {
                         i += data_len;
                     }
                     81 => {
-                        // Print QR code
+                        // Print QR code: pL pH cn fn m, skip m
+                        let skip = param_len.saturating_sub(2);
+                        i += skip.min(data.len() - i);
                         if !self.qr_data.is_empty() {
                             if !self.current_line.is_empty() {
                                 self.flush_line();
@@ -2138,6 +2158,12 @@ impl EscPosRenderer {
                         }
                     }
                     80 => {
+                        // Store DataMatrix data: pL pH cn fn m d1...dk, skip m
+                        if i >= data.len() {
+                            self.log_debug("GS ( k DataMatrix data incomplete (no m byte)");
+                            return Ok(start_i);
+                        }
+                        i += 1; // skip m byte
                         let data_len = param_len.saturating_sub(3);
                         if i + data_len > data.len() {
                             self.log_debug("GS ( k DataMatrix data incomplete");
@@ -2156,6 +2182,9 @@ impl EscPosRenderer {
                         i += skip.min(data.len() - i);
                     }
                     82 => {
+                        // Print DataMatrix: pL pH cn fn m, skip m
+                        let skip = param_len.saturating_sub(2);
+                        i += skip.min(data.len() - i);
                         if !self.datamatrix_data.is_empty() {
                             if !self.current_line.is_empty() {
                                 self.flush_line();
